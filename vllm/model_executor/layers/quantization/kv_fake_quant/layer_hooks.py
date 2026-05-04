@@ -146,7 +146,15 @@ def _resolve_smoothkv_scales(
     layer, prefix: str, cfg: KVCacheQuantConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Slice the full calib (num_layers, full_num_kv_heads, head_dim) down to
-    this layer + this TP worker's kv-head shard."""
+    this layer + this TP worker's kv-head shard.
+
+    Returns scales on the layer's device. The calib .pt is loaded onto CPU;
+    the runtime smoothkv kernel divides the on-device key/value by these
+    scales, so they must move to GPU here. (LayerKVQuantState's
+    register_buffer would do this automatically on `module.to(device)` —
+    but vLLM's v1 engine constructs Attention modules with the device
+    context already set, so the buffers are never explicitly migrated.)
+    """
     from vllm.distributed import get_tensor_model_parallel_rank
     from vllm.model_executor.models.utils import extract_layer_index
     try:
@@ -163,13 +171,24 @@ def _resolve_smoothkv_scales(
     s_k_full, s_v_full = _load_calib_cached(
         cfg.calib_path, _str_to_dtype(cfg.dtype)
     )
+    # Pin the slice to the same device as the layer's projection weights.
+    # Falls back to current CUDA device when the layer has no parameters yet.
+    try:
+        device = next(layer.parameters()).device
+    except StopIteration:
+        device = torch.device(
+            f"cuda:{torch.cuda.current_device()}"
+            if torch.cuda.is_available() else "cpu"
+        )
     full_kv_heads = s_k_full.shape[1]
     per_worker = layer.num_kv_heads
     if per_worker == full_kv_heads:
-        return s_k_full[layer_idx].clone(), s_v_full[layer_idx].clone()
+        return (s_k_full[layer_idx].clone().to(device),
+                s_v_full[layer_idx].clone().to(device))
     lo = tp_rank * per_worker
     hi = lo + per_worker
-    return s_k_full[layer_idx, lo:hi].clone(), s_v_full[layer_idx, lo:hi].clone()
+    return (s_k_full[layer_idx, lo:hi].clone().to(device),
+            s_v_full[layer_idx, lo:hi].clone().to(device))
 
 
 # ---------------------------------------------------------------------------
