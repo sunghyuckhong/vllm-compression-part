@@ -21,7 +21,11 @@ import torch.nn as nn
 from vllm.config import KVCacheQuantConfig, get_current_vllm_config_or_none
 from vllm.logger import init_logger
 
-from .kernels import fake_quantize_fp8, fake_quantize_pertoken
+from .kernels import (
+    fake_quantize_fp8,
+    fake_quantize_nvfp4,
+    fake_quantize_pertoken,
+)
 
 logger = init_logger(__name__)
 
@@ -39,14 +43,19 @@ class LayerKVQuantState(nn.Module):
     with the parent's ``module.to(device)``.
 
     Attributes:
-        method: "fp8" / "pertoken" / "smoothkv". Note: when the user picked
-            "smoothkv_fused", this is "pertoken" because the s_K/s_V scaling
-            was already folded into the projection weights at load time
-            (see ``fusion.py``).
+        method: "fp8" / "pertoken" / "smoothkv" / "nvfp4" / "smkv_nvfp4".
+            Note: when the user picked "smoothkv_fused", this is "pertoken"
+            because the s_K/s_V scaling was already folded into the projection
+            weights at load time (see ``fusion.py``).
         group_size: per-group size for the quant kernels.
-        bits: bit width (4 for pertoken/smoothkv, 8 for fp8 -- ignored on fp8).
+        bits: bit width (4 for pertoken/smoothkv, 8 for fp8 -- ignored on
+            fp8/nvfp4).
         s_k / s_v: SmoothKV per-(kv_head, channel) scales, registered as
-            non-persistent buffers. Only present when method == "smoothkv".
+            non-persistent buffers. Only present when method ==
+            "smoothkv" or "smkv_nvfp4".
+        gs_k / gs_v: NVFP4 per-tensor (per-layer) FP32 global scales,
+            registered as non-persistent buffers. Only present when method ==
+            "nvfp4" or "smkv_nvfp4".
     """
 
     def __init__(
@@ -56,6 +65,8 @@ class LayerKVQuantState(nn.Module):
         bits: int,
         s_k: torch.Tensor | None = None,
         s_v: torch.Tensor | None = None,
+        gs_k: torch.Tensor | None = None,
+        gs_v: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.method = method
@@ -67,6 +78,10 @@ class LayerKVQuantState(nn.Module):
             # be saved with state_dict.
             self.register_buffer("s_k", s_k, persistent=False)
             self.register_buffer("s_v", s_v, persistent=False)
+        if gs_k is not None:
+            assert gs_v is not None, "gs_k/gs_v must be provided together"
+            self.register_buffer("gs_k", gs_k, persistent=False)
+            self.register_buffer("gs_v", gs_v, persistent=False)
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +90,9 @@ class LayerKVQuantState(nn.Module):
 # ---------------------------------------------------------------------------
 
 _CALIB_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+_GLOBAL_SCALES_CACHE: dict[
+    tuple[str, bool], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _str_to_dtype(name: str) -> torch.dtype:
@@ -96,6 +114,28 @@ def _load_calib_cached(
     sv = calib["s_V"].to(dtype)
     _CALIB_CACHE[calib_path] = (sk, sv)
     return sk, sv
+
+
+def _load_global_scales_cached(
+    path: str, smooth: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load per-layer NVFP4 global scales from the derived .pt, kept FP32
+    on CPU and cached by (path, smooth). ``smooth=True`` selects the
+    SmoothKV+NVFP4 variant (gs_K_smooth / gs_V_smooth); ``smooth=False``
+    selects plain NVFP4 (gs_K_raw / gs_V_raw)."""
+    key = (path, smooth)
+    cached = _GLOBAL_SCALES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    blob = torch.load(path, weights_only=True)
+    if smooth:
+        gk, gv = blob["gs_K_smooth"], blob["gs_V_smooth"]
+    else:
+        gk, gv = blob["gs_K_raw"], blob["gs_V_raw"]
+    gk = gk.to(torch.float32)
+    gv = gv.to(torch.float32)
+    _GLOBAL_SCALES_CACHE[key] = (gk, gv)
+    return gk, gv
 
 
 def get_active_kv_quant_config() -> KVCacheQuantConfig | None:
@@ -130,8 +170,11 @@ def attach_kv_quant_to_layer(layer, prefix: str) -> None:
 
     runtime_method = "pertoken" if cfg.method == "smoothkv_fused" else cfg.method
     s_k, s_v = None, None
-    if cfg.method == "smoothkv":
+    gs_k, gs_v = None, None
+    if cfg.method in ("smoothkv", "smkv_nvfp4"):
         s_k, s_v = _resolve_smoothkv_scales(layer, prefix, cfg)
+    if cfg.method in ("nvfp4", "smkv_nvfp4"):
+        gs_k, gs_v = _resolve_nvfp4_global_scales(layer, prefix, cfg)
 
     layer.kv_quant_state = LayerKVQuantState(
         method=runtime_method,
@@ -139,6 +182,8 @@ def attach_kv_quant_to_layer(layer, prefix: str) -> None:
         bits=cfg.bits,
         s_k=s_k,
         s_v=s_v,
+        gs_k=gs_k,
+        gs_v=gs_v,
     )
 
 
@@ -191,6 +236,38 @@ def _resolve_smoothkv_scales(
             s_v_full[layer_idx, lo:hi].clone().to(device))
 
 
+def _resolve_nvfp4_global_scales(
+    layer, prefix: str, cfg: KVCacheQuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slice the per-layer NVFP4 global scale tensor (num_layers,) down to
+    this layer. Returns FP32 scalars (shape [1]) on the layer's device.
+
+    Global scale is per-tensor (per-layer) by NVFP4 spec, so it is the same
+    across all TP ranks and head shards -- no kv-head splitting required.
+    """
+    from vllm.model_executor.models.utils import extract_layer_index
+    try:
+        layer_idx = extract_layer_index(prefix)
+    except Exception as e:
+        raise RuntimeError(
+            f"[kv_fake_quant] NVFP4 could not extract layer_idx "
+            f"from prefix={prefix!r}"
+        ) from e
+    smooth = (cfg.method == "smkv_nvfp4")
+    gs_k_full, gs_v_full = _load_global_scales_cached(
+        cfg.global_scales_path, smooth=smooth,
+    )
+    try:
+        device = next(layer.parameters()).device
+    except StopIteration:
+        device = torch.device(
+            f"cuda:{torch.cuda.current_device()}"
+            if torch.cuda.is_available() else "cpu"
+        )
+    return (gs_k_full[layer_idx].clone().reshape(1).to(device),
+            gs_v_full[layer_idx].clone().reshape(1).to(device))
+
+
 # ---------------------------------------------------------------------------
 # Forward dispatch (called from Attention.forward)
 # ---------------------------------------------------------------------------
@@ -224,6 +301,18 @@ def apply_kv_quant(
         key = k_s * sk_flat
         v_s = value / sv_flat
         v_s = fake_quantize_pertoken(v_s, nh, hd, gs, bits)
+        value = v_s * sv_flat
+    elif method == "nvfp4":
+        key = fake_quantize_nvfp4(key, nh, hd, state.gs_k)
+        value = fake_quantize_nvfp4(value, nh, hd, state.gs_v)
+    elif method == "smkv_nvfp4":
+        sk_flat = state.s_k.reshape(-1)
+        sv_flat = state.s_v.reshape(-1)
+        k_s = key / sk_flat
+        k_s = fake_quantize_nvfp4(k_s, nh, hd, state.gs_k)
+        key = k_s * sk_flat
+        v_s = value / sv_flat
+        v_s = fake_quantize_nvfp4(v_s, nh, hd, state.gs_v)
         value = v_s * sv_flat
     else:
         raise ValueError(f"Unknown method: {method!r}")
