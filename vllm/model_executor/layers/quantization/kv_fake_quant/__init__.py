@@ -6,7 +6,9 @@ KV-cache fake-quantization for accuracy studies.
 
 Methods: BF16 / FP16 baselines, FP8 (per-token, group=128 default),
 per-token int{2,4} (KIVI-style), SmoothKV (per-step rescale + int4),
-SmoothKV-fused (load-time weight fold + plain pertoken int4).
+SmoothKV-fused (load-time weight fold + plain pertoken int4),
+NVFP4 (per-tensor FP32 + per-group FP8 + per-element FP4 E2M1),
+SmoothKV+NVFP4 (per-step rescale + NVFP4).
 
 The kernels run quant -> dequant in the same step. KV cache *storage* is
 unchanged (still BF16); only the *values* are constrained to the chosen
@@ -49,7 +51,11 @@ Public API (re-exported below):
     fake_quantize_fp8 / fake_quantize_pertoken      direct test/utility access
 """
 
-from .kernels import fake_quantize_fp8, fake_quantize_pertoken
+from .kernels import (
+    fake_quantize_fp8,
+    fake_quantize_nvfp4,
+    fake_quantize_pertoken,
+)
 from .layer_hooks import (
     LayerKVQuantState,
     apply_kv_quant,
@@ -67,5 +73,6 @@ __all__ = [
     "fuse_smoothkv_into_model",
     "LayerKVQuantState",
     "fake_quantize_fp8",
+    "fake_quantize_nvfp4",
     "fake_quantize_pertoken",
 ]
