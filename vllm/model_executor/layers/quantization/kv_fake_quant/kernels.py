@@ -3,16 +3,18 @@
 
 """Fake-quantization kernels for KV cache.
 
-Five ``@torch.library.custom_op`` ops that appear by name in inductor's FX
-graph dump (``computation_graph.py``):
+``@torch.library.custom_op`` ops that appear by name in inductor's FX graph
+dump (``computation_graph.py``):
 
     vllm_kv_quant::fake_quantize_dequantize_fp8(x, group_size) -> Tensor
+    vllm_kv_quant::fake_quantize_dequantize_nvfp4(x, global_scale) -> Tensor
     vllm_kv_quant::quant_and_pack_vcache(v, group_size, bits) -> (code, scale, mn)
     vllm_kv_quant::unpack_and_dequant_vcache(code, scale, mn, group_size, bits) -> Tensor
 
 Plus high-level shape-handling wrappers:
 
     fake_quantize_fp8(x, num_kv_heads, head_dim, group_size) -> Tensor
+    fake_quantize_nvfp4(x, num_kv_heads, head_dim, global_scale) -> Tensor
     fake_quantize_pertoken(x, num_kv_heads, head_dim, group_size, bits) -> Tensor
 
 The custom_ops are opaque to torch.compile -- the compiler doesn't try to
@@ -85,6 +87,92 @@ def _fake_quantize_dequantize_fp8(
 @_fake_quantize_dequantize_fp8.register_fake
 def _fake_quantize_dequantize_fp8_meta(
     data: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    return torch.empty_like(data)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 quant-dequant (per-tensor static global scale, per-group dynamic
+# FP8 E4M3 block scale, per-element FP4 E2M1)
+# ---------------------------------------------------------------------------
+
+_FP4_MAX = 6.0     # FP4_E2M1_DATA.max
+_NVFP4_GROUP_SIZE = 16
+
+
+def _round_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Round to nearest FP4 E2M1 grid value:
+        ±{0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+    Implemented via 7 midpoint comparisons -- bit-identical to
+    ``compressed_tensors.quantization.quant_args.FP4_E2M1_DATA.cast_to_fp4``.
+    """
+    sign = torch.sign(x)
+    a = x.abs()
+    # Midpoints between adjacent positive grid values.
+    out = torch.where(a < 0.25, torch.zeros_like(a), torch.full_like(a, 0.5))
+    out = torch.where(a >= 0.75, torch.full_like(a, 1.0), out)
+    out = torch.where(a >= 1.25, torch.full_like(a, 1.5), out)
+    out = torch.where(a >= 1.75, torch.full_like(a, 2.0), out)
+    out = torch.where(a >= 2.5,  torch.full_like(a, 3.0), out)
+    out = torch.where(a >= 3.5,  torch.full_like(a, 4.0), out)
+    out = torch.where(a >= 5.0,  torch.full_like(a, 6.0), out)
+    return sign * out
+
+
+@torch.library.custom_op(
+    "vllm_kv_quant::fake_quantize_dequantize_nvfp4", mutates_args=()
+)
+def _fake_quantize_dequantize_nvfp4(
+    data: torch.Tensor, global_scale: torch.Tensor,
+) -> torch.Tensor:
+    """NVFP4 quant-dequant on (B, nh, T, D) input.
+
+    NVFP4 = per-tensor FP32 ``global_scale`` (input) + per-group FP8 E4M3
+    block scale (computed dynamically over groups of 16 along D) + per-element
+    FP4 E2M1 storage. Round-trip:
+        local_scale_fp8 = round_to_fp8(amax_per_group * global_scale / FP4_MAX)
+        eff_scale       = local_scale_fp8 / global_scale
+        x_q             = dequant(round_to_fp4(x / eff_scale)) * eff_scale
+    """
+    B, nh, T, D = data.shape
+    G = _NVFP4_GROUP_SIZE
+    assert D % G == 0, f"head_dim {D} must be divisible by NVFP4 group_size {G}"
+    num_groups = D // G
+
+    grouped = data.view(B, nh, T, num_groups, G).to(torch.float32)
+    gs = global_scale.to(torch.float32).reshape(1)
+
+    # 1. per-group amax → FP8 local scale
+    amax = grouped.abs().amax(dim=-1, keepdim=True)
+    local_scale_unrounded = amax * gs / _FP4_MAX
+    if _is_sm89_or_newer():
+        local_scale = local_scale_unrounded.clamp(max=_FP8_MAX).to(_FP8_DTYPE).to(torch.float32)
+    else:
+        local_scale = _round_to_fp8e4m3(local_scale_unrounded)
+    # FP4 has eps=0.25 in the FP8 grid; replace zero scales to avoid div-by-0
+    local_scale = torch.where(
+        local_scale == 0,
+        torch.full_like(local_scale, 0.25),
+        local_scale,
+    )
+
+    # 2. effective per-element scale = local_scale / global_scale
+    eff_scale = local_scale / gs
+
+    # 3. quantize: x / eff_scale, clamp to ±FP4_MAX, round to FP4 grid
+    scaled = grouped / eff_scale
+    scaled = scaled.clamp(min=-_FP4_MAX, max=_FP4_MAX)
+    fp4 = _round_to_fp4_e2m1(scaled)
+
+    # 4. dequantize
+    out = (fp4 * eff_scale).view(B, nh, T, D)
+    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out.to(data.dtype)
+
+
+@_fake_quantize_dequantize_nvfp4.register_fake
+def _fake_quantize_dequantize_nvfp4_meta(
+    data: torch.Tensor, global_scale: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(data)
 
@@ -200,6 +288,22 @@ def fake_quantize_fp8(
     orig_dtype = x.dtype
     x4 = _to_bnhtd(x, num_kv_heads, head_dim)
     out = torch.ops.vllm_kv_quant.fake_quantize_dequantize_fp8(x4, group_size)
+    return _from_bnhtd(out, orig_shape).to(orig_dtype)
+
+
+def fake_quantize_nvfp4(
+    x: torch.Tensor, num_kv_heads: int, head_dim: int,
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    """NVFP4 round-trip with reshape into KIVI's canonical layout.
+
+    ``global_scale`` is a per-tensor (per-layer) FP32 scalar derived offline
+    from the K (or V) cache amax, see ``scripts/derive_nvfp4_global_scales.py``.
+    """
+    orig_shape = x.shape
+    orig_dtype = x.dtype
+    x4 = _to_bnhtd(x, num_kv_heads, head_dim)
+    out = torch.ops.vllm_kv_quant.fake_quantize_dequantize_nvfp4(x4, global_scale)
     return _from_bnhtd(out, orig_shape).to(orig_dtype)
 
 
