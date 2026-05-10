@@ -103,19 +103,28 @@ _NVFP4_GROUP_SIZE = 16
 def _round_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     """Round to nearest FP4 E2M1 grid value:
         ±{0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
-    Implemented via 7 midpoint comparisons -- bit-identical to
-    ``compressed_tensors.quantization.quant_args.FP4_E2M1_DATA.cast_to_fp4``.
+
+    Bit-identical to ``compressed_tensors.quantization.quant_args.FP4_E2M1_DATA
+    .cast_to_fp4`` — including its asymmetric tie-breaking at exact midpoints
+    {0.25, 1.25, 2.5, 5.0} which round DOWN to the smaller grid value
+    (compressed_tensors closes its smaller-magnitude intervals on both sides:
+    [0,0.25], [0.75,1.25], [1.75,2.5], [3.5,5.0]).
+
+    Practically these midpoints are measure-zero in real-valued inputs, but
+    matching the canonical reference avoids spurious skew at the few tie cases.
     """
     sign = torch.sign(x)
     a = x.abs()
     # Midpoints between adjacent positive grid values.
-    out = torch.where(a < 0.25, torch.zeros_like(a), torch.full_like(a, 0.5))
+    # Inequalities chosen so a==0.25→0, a==1.25→1, a==2.5→2, a==5→4
+    # (matches compressed_tensors round-half-toward-smaller).
+    out = torch.where(a <= 0.25, torch.zeros_like(a), torch.full_like(a, 0.5))
     out = torch.where(a >= 0.75, torch.full_like(a, 1.0), out)
-    out = torch.where(a >= 1.25, torch.full_like(a, 1.5), out)
+    out = torch.where(a >  1.25, torch.full_like(a, 1.5), out)
     out = torch.where(a >= 1.75, torch.full_like(a, 2.0), out)
-    out = torch.where(a >= 2.5,  torch.full_like(a, 3.0), out)
+    out = torch.where(a >  2.5,  torch.full_like(a, 3.0), out)
     out = torch.where(a >= 3.5,  torch.full_like(a, 4.0), out)
-    out = torch.where(a >= 5.0,  torch.full_like(a, 6.0), out)
+    out = torch.where(a >  5.0,  torch.full_like(a, 6.0), out)
     return sign * out
 
 
@@ -127,12 +136,18 @@ def _fake_quantize_dequantize_nvfp4(
 ) -> torch.Tensor:
     """NVFP4 quant-dequant on (B, nh, T, D) input.
 
-    NVFP4 = per-tensor FP32 ``global_scale`` (input) + per-group FP8 E4M3
-    block scale (computed dynamically over groups of 16 along D) + per-element
-    FP4 E2M1 storage. Round-trip:
-        local_scale_fp8 = round_to_fp8(amax_per_group * global_scale / FP4_MAX)
-        eff_scale       = local_scale_fp8 / global_scale
-        x_q             = dequant(round_to_fp4(x / eff_scale)) * eff_scale
+    Bit-identical to ``vllm.model_executor.layers.quantization.utils.
+    nvfp4_emulation_utils.ref_nvfp4_quant`` for fp32 ``global_scale``
+    (verified at file head). Compute order matches the reference:
+
+        scale          = round_fp8(amax_per_group * global_scale / FP4_MAX)
+        output_scale   = 1 / (scale * (1 / global_scale))
+        x_fp4          = round_fp4(clamp(x * output_scale, -6, 6))
+        x_dequantized  = x_fp4 * (scale / global_scale)
+
+    The reciprocal-then-multiply ordering matters at fp32 ULP-level for
+    bf16 inputs near the FP4 grid boundaries; using `x / (scale/gs)` directly
+    introduces ~0.1% disagreements with the reference for those edge cases.
     """
     B, nh, T, D = data.shape
     G = _NVFP4_GROUP_SIZE
@@ -144,29 +159,30 @@ def _fake_quantize_dequantize_nvfp4(
 
     # 1. per-group amax → FP8 local scale
     amax = grouped.abs().amax(dim=-1, keepdim=True)
-    local_scale_unrounded = amax * gs / _FP4_MAX
+    local_scale_unrounded = gs * (amax * (1.0 / _FP4_MAX))
     if _is_sm89_or_newer():
-        local_scale = local_scale_unrounded.clamp(max=_FP8_MAX).to(_FP8_DTYPE).to(torch.float32)
+        local_scale = local_scale_unrounded.clamp(max=_FP8_MAX, min=-_FP8_MAX).to(_FP8_DTYPE).to(torch.float32)
     else:
         local_scale = _round_to_fp8e4m3(local_scale_unrounded)
-    # FP4 has eps=0.25 in the FP8 grid; replace zero scales to avoid div-by-0
-    local_scale = torch.where(
-        local_scale == 0,
-        torch.full_like(local_scale, 0.25),
-        local_scale,
-    )
 
-    # 2. effective per-element scale = local_scale / global_scale
-    eff_scale = local_scale / gs
+    # 2. quantize using ref's reciprocal-then-multiply ordering (bit-identical
+    # to ref_nvfp4_quant: output_scale = 1 / (scale * (1/global_scale)))
+    gs_reciprocal = 1.0 / (gs + (gs == 0) * 1e8)
+    inner = local_scale * gs_reciprocal
+    output_scale = 1.0 / (inner + (inner == 0) * 1e8)
 
-    # 3. quantize: x / eff_scale, clamp to ±FP4_MAX, round to FP4 grid
-    scaled = grouped / eff_scale
+    # 3. quantize: x * output_scale, clamp to ±FP4_MAX, round to FP4 grid
+    scaled = grouped * output_scale
     scaled = scaled.clamp(min=-_FP4_MAX, max=_FP4_MAX)
     fp4 = _round_to_fp4_e2m1(scaled)
 
-    # 4. dequantize
-    out = (fp4 * eff_scale).view(B, nh, T, D)
-    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    # 4. dequantize using ref's order: fp4 * (scale / global_scale)
+    # (direct division — must NOT use scale * (1/gs), it differs at fp32 ULP)
+    dequant_scale = local_scale / gs
+    out = (fp4 * dequant_scale).view(B, nh, T, D)
+    # Bit-identical to ref_nvfp4_quant: do NOT sanitize NaN/Inf here. Real
+    # K-cache values never contain NaN/Inf in normal inference; if they do,
+    # the upstream model is already broken and we want the failure to surface.
     return out.to(data.dtype)
 
 
