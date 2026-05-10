@@ -180,7 +180,9 @@ def _fake_quantize_dequantize_nvfp4(
     # (direct division — must NOT use scale * (1/gs), it differs at fp32 ULP)
     dequant_scale = local_scale / gs
     out = (fp4 * dequant_scale).view(B, nh, T, D)
-    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    # Bit-identical to ref_nvfp4_quant: do NOT sanitize NaN/Inf here. Real
+    # K-cache values never contain NaN/Inf in normal inference; if they do,
+    # the upstream model is already broken and we want the failure to surface.
     return out.to(data.dtype)
 
 
