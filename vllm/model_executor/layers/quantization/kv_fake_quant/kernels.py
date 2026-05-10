@@ -103,19 +103,28 @@ _NVFP4_GROUP_SIZE = 16
 def _round_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     """Round to nearest FP4 E2M1 grid value:
         ±{0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
-    Implemented via 7 midpoint comparisons -- bit-identical to
-    ``compressed_tensors.quantization.quant_args.FP4_E2M1_DATA.cast_to_fp4``.
+
+    Bit-identical to ``compressed_tensors.quantization.quant_args.FP4_E2M1_DATA
+    .cast_to_fp4`` — including its asymmetric tie-breaking at exact midpoints
+    {0.25, 1.25, 2.5, 5.0} which round DOWN to the smaller grid value
+    (compressed_tensors closes its smaller-magnitude intervals on both sides:
+    [0,0.25], [0.75,1.25], [1.75,2.5], [3.5,5.0]).
+
+    Practically these midpoints are measure-zero in real-valued inputs, but
+    matching the canonical reference avoids spurious skew at the few tie cases.
     """
     sign = torch.sign(x)
     a = x.abs()
     # Midpoints between adjacent positive grid values.
-    out = torch.where(a < 0.25, torch.zeros_like(a), torch.full_like(a, 0.5))
+    # Inequalities chosen so a==0.25→0, a==1.25→1, a==2.5→2, a==5→4
+    # (matches compressed_tensors round-half-toward-smaller).
+    out = torch.where(a <= 0.25, torch.zeros_like(a), torch.full_like(a, 0.5))
     out = torch.where(a >= 0.75, torch.full_like(a, 1.0), out)
-    out = torch.where(a >= 1.25, torch.full_like(a, 1.5), out)
+    out = torch.where(a >  1.25, torch.full_like(a, 1.5), out)
     out = torch.where(a >= 1.75, torch.full_like(a, 2.0), out)
-    out = torch.where(a >= 2.5,  torch.full_like(a, 3.0), out)
+    out = torch.where(a >  2.5,  torch.full_like(a, 3.0), out)
     out = torch.where(a >= 3.5,  torch.full_like(a, 4.0), out)
-    out = torch.where(a >= 5.0,  torch.full_like(a, 6.0), out)
+    out = torch.where(a >  5.0,  torch.full_like(a, 6.0), out)
     return sign * out
 
 
